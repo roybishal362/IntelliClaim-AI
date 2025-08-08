@@ -1,3 +1,16 @@
+import subprocess
+import time
+import os
+
+# Start backend API from main.py
+backend_process = subprocess.Popen(
+    ["python", "main.py"],
+    env=os.environ.copy()
+)
+
+# Give the backend a moment to start
+time.sleep(3)
+
 """
 🧠🔥 PROFESSIONAL STREAMLIT UI FOR ENHANCED DOCUMENT QUERY SYSTEM
 High-quality frontend matching backend excellence
