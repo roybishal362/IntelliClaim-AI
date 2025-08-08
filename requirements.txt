@@ -35,4 +35,3 @@ streamlit
 requests
 pandas
 plotly
-subprocess 
