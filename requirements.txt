@@ -1,0 +1,37 @@
+fastapi
+uvicorn[standard]
+pydantic
+requests
+python-multipart
+
+# LangChain and document processing
+langchain
+langchain-community
+unstructured[local-inference]
+pdf2image
+Pillow
+python-magic
+
+# Embeddings and vector store
+sentence-transformers
+faiss-cpu
+numpy
+
+# Groq API
+groq
+
+# Hybrid retrieval - Whoosh for keyword search
+Whoosh
+
+# Knowledge graph
+networkx
+
+# Utilities
+python-dotenv
+aiofiles
+
+# requirements_streamlit.txt - Frontend Dependencies
+streamlit
+requests
+pandas
+plotly
