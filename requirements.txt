@@ -4,6 +4,7 @@ pydantic
 requests
 python-multipart
 networkx
+
 # LangChain and document processing
 langchain
 langchain-community
@@ -23,15 +24,11 @@ groq
 # Hybrid retrieval - Whoosh for keyword search
 Whoosh
 
-# Knowledge graph
-networkx
-
 # Utilities
 python-dotenv
 aiofiles
 
-# requirements_streamlit.txt - Frontend Dependencies
+# Frontend dependencies
 streamlit
-requests
 pandas
 plotly
