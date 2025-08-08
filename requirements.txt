@@ -3,7 +3,7 @@ uvicorn[standard]
 pydantic
 requests
 python-multipart
-
+networkx
 # LangChain and document processing
 langchain
 langchain-community
