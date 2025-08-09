@@ -1,584 +1,170 @@
 """
-🧠🔥 UNIFIED AI DOCUMENT QUERY SYSTEM
-FastAPI Backend + Streamlit Frontend in ONE FILE for easy deployment
+🧠🔥 PROFESSIONAL STREAMLIT UI FOR ENHANCED DOCUMENT QUERY SYSTEM
+High-quality frontend matching backend excellence
+
+UPDATED: Adds optional local-backend orchestration (start/stop main.py)
+- Keeps original UI & API behavior unchanged
+- Spawns main.py as a subprocess (unmodified) only when requested
+- Prefers local backend when available
 """
 
 import os
-import json
-import logging
-import asyncio
-import threading
+import sys
 import time
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+import json
+import socket
+import threading
+import subprocess
 import tempfile
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dataclasses import dataclass
-import networkx as nx
-import re
+from io import BytesIO
+import base64
 
-# Check if running in Streamlit mode
-import sys
-IS_STREAMLIT = 'streamlit' in sys.modules or 'streamlit' in str(sys.argv)
+# ---------------------------
+# New: Utilities for managing local backend (runs main.py) — added conservatively
+# ---------------------------
 
-if not IS_STREAMLIT:
-    # FastAPI imports (only when not in Streamlit)
-    from fastapi import FastAPI, HTTPException, Depends, Header
-    from pydantic import BaseModel, Field
-    import uvicorn
+def _is_port_open(host: str, port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception:
+        return False
 
-# Common imports for both modes
-from langchain.document_loaders import (
-    UnstructuredPDFLoader, 
-    UnstructuredWordDocumentLoader,
-    UnstructuredEmailLoader
-)
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.schema import Document
-
-# Groq API
-from groq import Groq
-
-# Streamlit (only import when in Streamlit mode)
-if IS_STREAMLIT:
-    import streamlit as st
-
-# Whoosh for keyword search
-try:
-    from whoosh.index import create_in
-    from whoosh.fields import Schema, TEXT, ID
-    from whoosh.qparser import QueryParser
-    WHOOSH_AVAILABLE = True
-except ImportError:
-    WHOOSH_AVAILABLE = False
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ========================
-# 🔧 CONFIGURATION
-# ========================
-
-class Config:
-    # Groq API
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
-    
-    # Best open-source models on Groq
-    LLM_MODEL_OPTIONS = [
-        "llama-3.1-70b-versatile",      # Best overall
-        "llama-3.1-8b-instant",        # Fast
-        "mixtral-8x7b-32768",          # Excellent reasoning
-        "gemma2-9b-it",                # Good balance
-    ]
-    
-    LLM_MODEL_NAME = LLM_MODEL_OPTIONS[0]
-    EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-    
-    # Processing
-    MAX_TOKENS = 4096
-    TEMPERATURE = 0.1
-    TOP_P = 0.9
-    CHUNK_SIZE = 512
-    CHUNK_OVERLAP = 50
-    TOP_K_RETRIEVAL = 6
-    
-    # Hybrid weights
-    SEMANTIC_WEIGHT = 0.7
-    KEYWORD_WEIGHT = 0.3
-    
-    # API
-    HACKRX_TOKEN = "90bf5fcfc3d0de340e50ac29a5cf53eb6da42e7a24af15f2111186878d510d6c"
-    MAX_QUESTIONS = 10
-
-# ========================
-# 📊 DATA MODELS
-# ========================
-
-@dataclass
-class ClauseNode:
-    clause_id: str
-    content: str
-    clause_type: str
-    age_limit: Optional[int] = None
-    waiting_period: Optional[int] = None
-    amount_limit: Optional[float] = None
-    dependencies: List[str] = None
-    conflicts: List[str] = None
-
-if not IS_STREAMLIT:
-    # FastAPI models (only when not in Streamlit)
-    class QueryRequest(BaseModel):
-        documents: str = Field(..., description="URL to document")
-        questions: List[str] = Field(..., description="List of questions")
-
-    class AnswerItem(BaseModel):
-        question: str
-        answer: str
-        confidence: float
-        source_clauses: List[str]
-        justification: str
-        conflicts_detected: List[str] = []
-
-    class QueryResponse(BaseModel):
-        answers: List[AnswerItem]
-        processing_time: float
-        audit_trail: List[str]
-
-# ========================
-# 🤖 GROQ LLM MANAGER
-# ========================
-
-class GroqLLM:
-    def __init__(self):
-        if not Config.GROQ_API_KEY or Config.GROQ_API_KEY == "your_groq_api_key_here":
-            if IS_STREAMLIT:
-                st.error("❌ Please set GROQ_API_KEY in your environment or Streamlit secrets")
-                st.stop()
-            else:
-                raise ValueError("Please set GROQ_API_KEY environment variable")
-        
-        self.client = Groq(api_key=Config.GROQ_API_KEY)
-        self.model_name = Config.LLM_MODEL_NAME
-        logger.info(f"🚀 Initialized Groq LLM: {self.model_name}")
-    
-    async def generate_response(self, prompt: str, max_tokens: int = 1024) -> str:
+def _wait_for_http(url: str, timeout: float = 30.0, interval: float = 0.5) -> bool:
+    """Polls the given URL until it returns a successful response or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an expert legal and insurance document analyst."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=max_tokens,
-                temperature=Config.TEMPERATURE,
-                top_p=Config.TOP_P
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            return f"Error processing request: {str(e)}"
+            r = requests.get(url, timeout=3.0)
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
 
-# ========================
-# 🧾 DOCUMENT PROCESSOR
-# ========================
+class LocalBackendController:
+    """
+    Controller to spawn and manage a local backend process running your unmodified main.py.
+    - Launch: runs `python -u main.py` in provided working directory.
+    - Health: checks /health endpoint on provided host:port.
+    - Stop: terminates spawned process (only if it was spawned by this controller).
+    """
 
-class DocumentProcessor:
-    def __init__(self):
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=Config.CHUNK_SIZE,
-            chunk_overlap=Config.CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " "]
-        )
-    
-    async def download_document(self, url: str) -> str:
-        try:
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            
-            # Determine file type
-            content_type = response.headers.get('content-type', '').lower()
-            if 'pdf' in content_type or url.lower().endswith('.pdf'):
-                suffix = '.pdf'
-            elif 'word' in content_type or url.lower().endswith(('.docx', '.doc')):
-                suffix = '.docx'
-            elif 'email' in content_type or url.lower().endswith('.eml'):
-                suffix = '.eml'
-            else:
-                suffix = '.pdf'
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(response.content)
-                return tmp_file.name
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            raise Exception(f"Failed to download document: {e}")
-    
-    async def parse_document(self, file_path: str) -> Tuple[List[Document], List[ClauseNode]]:
-        try:
-            file_ext = Path(file_path).suffix.lower()
-            
-            if file_ext == '.pdf':
-                loader = UnstructuredPDFLoader(file_path)
-            elif file_ext in ['.docx', '.doc']:
-                loader = UnstructuredWordDocumentLoader(file_path)
-            elif file_ext == '.eml':
-                loader = UnstructuredEmailLoader(file_path)
-            else:
-                loader = UnstructuredPDFLoader(file_path)
-            
-            documents = loader.load()
-            
-            # Add metadata and split
-            for i, doc in enumerate(documents):
-                doc.metadata.update({
-                    'source_file': Path(file_path).name,
-                    'chunk_id': i,
-                    'processed_at': datetime.now().isoformat()
-                })
-            
-            chunks = self.text_splitter.split_documents(documents)
-            clause_nodes = []
-            
-            for i, chunk in enumerate(chunks):
-                clause_id = f"clause_{i+1}"
-                chunk.metadata['clause_id'] = clause_id
-                chunk.metadata['clause_no'] = i + 1
-                
-                # Create clause node with structure extraction
-                clause_node = self._extract_clause_structure(chunk.page_content, clause_id)
-                clause_nodes.append(clause_node)
-            
-            logger.info(f"📄 Parsed into {len(chunks)} chunks")
-            return chunks, clause_nodes
-            
-        except Exception as e:
-            logger.error(f"Parse error: {e}")
-            raise Exception(f"Failed to parse document: {e}")
-    
-    def _extract_clause_structure(self, content: str, clause_id: str) -> ClauseNode:
-        content_lower = content.lower()
-        
-        # Determine clause type
-        clause_type = "general"
-        if any(word in content_lower for word in ['cover', 'benefit', 'include']):
-            clause_type = "coverage"
-        elif any(word in content_lower for word in ['exclude', 'not cover', 'except']):
-            clause_type = "exclusion"
-        elif any(word in content_lower for word in ['condition', 'requirement']):
-            clause_type = "condition"
-        
-        # Extract age limits
-        age_limit = None
-        age_match = re.search(r'age\s+(\d+)|(\d+)\s+years?\s+old', content_lower)
-        if age_match:
-            age_limit = int(age_match.group(1) or age_match.group(2))
-        
-        # Extract waiting periods  
-        waiting_period = None
-        wait_match = re.search(r'(\d+)\s+days?\s+wait|waiting\s+period\s+(\d+)', content_lower)
-        if wait_match:
-            waiting_period = int(wait_match.group(1) or wait_match.group(2))
-        
-        return ClauseNode(
-            clause_id=clause_id,
-            content=content,
-            clause_type=clause_type,
-            age_limit=age_limit,
-            waiting_period=waiting_period,
-            dependencies=[],
-            conflicts=[]
-        )
+    def __init__(self, python_executable: str = sys.executable, main_path: str = "main.py",
+                 host: str = "127.0.0.1", port: int = 8000, env: Optional[dict] = None):
+        self.python_executable = python_executable
+        self.main_path = main_path
+        self.host = host
+        self.port = port
+        self.env = env or os.environ.copy()
+        self._proc: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
 
-# ========================
-# 🔍 HYBRID RETRIEVAL
-# ========================
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
 
-class HybridRetriever:
-    def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=Config.EMBEDDING_MODEL,
-            model_kwargs={'device': 'cpu'}
-        )
-        self.vectorstore = None
-        self.documents = None
-    
-    async def setup(self, documents: List[Document]):
-        self.documents = documents
-        # Create FAISS vectorstore
-        self.vectorstore = await asyncio.get_event_loop().run_in_executor(
-            None, FAISS.from_documents, documents, self.embeddings
-        )
-    
-    def retrieve(self, query: str, top_k: int = Config.TOP_K_RETRIEVAL) -> List[Dict]:
-        try:
-            # Semantic search
-            semantic_results = self.vectorstore.similarity_search_with_score(query, k=top_k)
-            
-            retrieved = []
-            for doc, score in semantic_results:
-                # Normalize semantic score
-                semantic_score = max(0.0, 1.0 - (score / 2.0))
-                
-                # Simple keyword scoring
-                keyword_score = self._keyword_score(query, doc.page_content)
-                
-                # Combined score
-                final_score = (Config.SEMANTIC_WEIGHT * semantic_score + 
-                              Config.KEYWORD_WEIGHT * keyword_score)
-                
-                retrieved.append({
-                    'content': doc.page_content,
-                    'metadata': doc.metadata,
-                    'semantic_score': semantic_score,
-                    'keyword_score': keyword_score,
-                    'final_score': final_score,
-                    'clause_id': doc.metadata.get('clause_id', ''),
-                    'source_info': f"Clause {doc.metadata.get('clause_no', 'N/A')}"
-                })
-            
-            # Sort by final score
-            retrieved.sort(key=lambda x: x['final_score'], reverse=True)
-            return retrieved
-            
-        except Exception as e:
-            logger.error(f"Retrieval error: {e}")
-            return []
-    
-    def _keyword_score(self, query: str, content: str) -> float:
-        query_words = set(query.lower().split())
-        content_words = set(content.lower().split())
-        
-        if not query_words:
-            return 0.0
-        
-        intersection = query_words.intersection(content_words)
-        return len(intersection) / len(query_words)
+    @property
+    def health_url(self) -> str:
+        return f"{self.base_url}/health"
 
-# ========================
-# 🎯 UNIFIED PROCESSING ENGINE
-# ========================
+    def is_running(self) -> bool:
+        # If we spawned it and process is alive and port open -> running
+        if self._proc and self._proc.poll() is None:
+            return _is_port_open(self.host, self.port)
+        # Maybe main.py was started externally; check port
+        return _is_port_open(self.host, self.port)
 
-class UnifiedQueryEngine:
-    def __init__(self):
-        self.llm = None
-        self.doc_processor = DocumentProcessor()
-        self.retriever = HybridRetriever()
-        self.kg = nx.DiGraph()
-        
-        # Initialize LLM
-        try:
-            self.llm = GroqLLM()
-        except Exception as e:
-            logger.error(f"LLM initialization failed: {e}")
-            if IS_STREAMLIT:
-                st.error(f"❌ Failed to initialize LLM: {e}")
-    
-    async def process_query(self, document_url: str, questions: List[str]) -> Dict:
-        start_time = datetime.now()
-        audit_trail = []
-        
-        try:
-            audit_trail.append("🚀 Starting document analysis...")
-            
-            # Download and parse
-            audit_trail.append("📥 Downloading document...")
-            file_path = await self.doc_processor.download_document(document_url)
-            
-            audit_trail.append("📄 Parsing document...")
-            documents, clause_nodes = await self.doc_processor.parse_document(file_path)
-            
-            # Setup retrieval
-            audit_trail.append("🔍 Setting up retrieval system...")
-            await self.retriever.setup(documents)
-            
-            # Build simple knowledge graph
-            audit_trail.append("🕸️ Building knowledge graph...")
-            self._build_knowledge_graph(clause_nodes)
-            
-            answers = []
-            
-            # Process each question
-            for i, question in enumerate(questions, 1):
-                audit_trail.append(f"❓ Processing question {i}...")
-                
-                # Retrieve relevant clauses
-                retrieved = self.retriever.retrieve(question)
-                
-                # Detect conflicts
-                conflicts = self._detect_conflicts(retrieved)
-                
-                # Generate answer
-                answer = await self._generate_answer(question, retrieved, conflicts)
-                answers.append(answer)
-                
-                audit_trail.append(f"✅ Question {i} completed (confidence: {answer['confidence']:.0%})")
-            
-            # Cleanup
+    def start(self, timeout: float = 30.0) -> Tuple[bool, str]:
+        """
+        Start main.py as a subprocess if it's not already running.
+        Returns (success, message).
+        """
+        with self._lock:
+            if self.is_running():
+                return True, f"Backend already running at {self.base_url}"
+
+            main_fullpath = os.path.abspath(self.main_path)
+            if not os.path.exists(main_fullpath):
+                return False, f"main.py not found at {main_fullpath}"
+
+            cmd = [self.python_executable, "-u", main_fullpath]
             try:
-                os.unlink(file_path)
-            except:
-                pass
-            
-            processing_time = (datetime.now() - start_time).total_seconds()
-            audit_trail.append(f"🏁 Completed in {processing_time:.2f}s")
-            
-            return {
-                'answers': answers,
-                'processing_time': processing_time,
-                'audit_trail': audit_trail
-            }
-            
-        except Exception as e:
-            error_msg = f"Processing failed: {str(e)}"
-            logger.error(error_msg)
-            audit_trail.append(f"❌ Error: {error_msg}")
-            
-            return {
-                'answers': [],
-                'processing_time': (datetime.now() - start_time).total_seconds(),
-                'audit_trail': audit_trail,
-                'error': error_msg
-            }
-    
-    def _build_knowledge_graph(self, clause_nodes: List[ClauseNode]):
-        """Build simple knowledge graph"""
-        for node in clause_nodes:
-            self.kg.add_node(node.clause_id, **node.__dict__)
-        
-        # Detect simple relationships
-        for i, node1 in enumerate(clause_nodes):
-            for j, node2 in enumerate(clause_nodes):
-                if i >= j:
-                    continue
-                
-                # Conflict detection (exclusion vs coverage)
-                if (node1.clause_type == "coverage" and node2.clause_type == "exclusion") or \
-                   (node1.clause_type == "exclusion" and node2.clause_type == "coverage"):
-                    words1 = set(node1.content.lower().split())
-                    words2 = set(node2.content.lower().split())
-                    if len(words1.intersection(words2)) > 5:
-                        self.kg.add_edge(node1.clause_id, node2.clause_id, relation="conflicts")
-    
-    def _detect_conflicts(self, retrieved: List[Dict]) -> List[str]:
-        """Detect conflicts using knowledge graph"""
-        conflicts = []
-        for item in retrieved:
-            clause_id = item['clause_id']
-            if clause_id in self.kg:
-                for neighbor in self.kg.neighbors(clause_id):
-                    if self.kg[clause_id][neighbor].get('relation') == 'conflicts':
-                        conflicts.append(f"Conflicts with {neighbor}")
-        return list(set(conflicts))
-    
-    async def _generate_answer(self, question: str, retrieved: List[Dict], conflicts: List[str]) -> Dict:
-        """Generate structured answer"""
-        if not retrieved:
-            return {
-                'question': question,
-                'answer': "I couldn't find relevant information in the document.",
-                'confidence': 0.0,
-                'source_clauses': [],
-                'justification': "No relevant clauses found",
-                'conflicts_detected': []
-            }
-        
-        # Prepare context
-        context = ""
-        source_clauses = []
-        
-        for i, item in enumerate(retrieved[:4], 1):
-            context += f"\n[Clause {i}] {item['content'][:400]}...\n"
-            source_clauses.append(f"Clause {item['metadata'].get('clause_no', i)} (Score: {item['final_score']:.2f})")
-        
-        # Create prompt
-        prompt = f"""Analyze this insurance/legal document question using the provided clauses.
+                # Spawn process with captured stdout/stderr for diagnostics
+                self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              env=self.env, cwd=os.path.dirname(main_fullpath) or None)
+            except Exception as e:
+                return False, f"Failed to spawn backend process: {e}"
 
-Question: {question}
+            # Wait for health endpoint to become available
+            ok = _wait_for_http(self.health_url, timeout=timeout, interval=0.5)
+            if not ok:
+                stderr_preview = ""
+                try:
+                    if self._proc and self._proc.stderr:
+                        stderr_preview = self._proc.stderr.read().decode(errors="ignore")[:2000]
+                except Exception:
+                    pass
+                return False, f"Backend did not become healthy within {timeout}s. stderr (prefix): {stderr_preview}"
+            return True, f"Backend started and healthy at {self.base_url}"
 
-Relevant Clauses:
-{context}
+    def stop(self) -> Tuple[bool, str]:
+        with self._lock:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                    self._proc = None
+                    return True, "Local backend process terminated."
+                except Exception as e:
+                    return False, f"Error terminating process: {e}"
+            else:
+                # Nothing to stop that we spawned
+                return False, "No spawned backend process to stop (the backend may have been started externally)."
 
-Provide a comprehensive answer that:
-1. Directly answers the question
-2. Includes specific details (amounts, periods, conditions)
-3. Mentions any limitations or exclusions
-4. Is clear and factual
+# ---------------------------
+# Original app.py content follows — preserved and augmented
+# ---------------------------
 
-Answer:"""
-        
-        answer_text = await self.llm.generate_response(prompt, max_tokens=600)
-        
-        # Calculate confidence
-        avg_score = sum(item['final_score'] for item in retrieved[:3]) / min(3, len(retrieved))
-        confidence = min(0.95, max(0.1, avg_score))
-        
-        return {
-            'question': question,
-            'answer': answer_text,
-            'confidence': round(confidence, 2),
-            'source_clauses': source_clauses,
-            'justification': f"Based on {len(retrieved)} retrieved clauses with avg score {avg_score:.2f}",
-            'conflicts_detected': conflicts
-        }
+# Page configuration
+st.set_page_config(
+    page_title="🧠 AI Document Query System",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': None,
+        'Report a bug': None,
+        'About': "Enhanced LLM Document Query System v3.0"
+    }
+)
 
-# ========================
-# 🚀 FASTAPI BACKEND (Only when not in Streamlit)
-# ========================
-
-if not IS_STREAMLIT:
-    app = FastAPI(title="🧠 AI Document Query API", version="3.0.0")
-    query_engine = None
-    
-    @app.on_event("startup")
-    async def startup():
-        global query_engine
-        query_engine = UnifiedQueryEngine()
-    
-    def verify_token(authorization: str = Header(None)):
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Invalid authorization header")
-        token = authorization[7:]
-        if token != Config.HACKRX_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return token
-    
-    @app.get("/")
-    async def root():
-        return {
-            "message": "🧠🔥 AI Document Query System",
-            "version": "3.0.0",
-            "status": "ready",
-            "model": Config.LLM_MODEL_NAME
-        }
-    
-    @app.get("/health")
-    async def health():
-        groq_status = "connected" if query_engine and query_engine.llm else "disconnected"
-        return {
-            "status": "healthy",
-            "groq_api_status": groq_status,
-            "model": Config.LLM_MODEL_NAME,
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    @app.post("/hackrx/run", response_model=QueryResponse)
-    async def hackrx_run(request: QueryRequest, token: str = Depends(verify_token)):
-        if not query_engine:
-            raise HTTPException(status_code=503, detail="Service not ready")
-        
-        if len(request.questions) > Config.MAX_QUESTIONS:
-            raise HTTPException(status_code=400, detail=f"Max {Config.MAX_QUESTIONS} questions")
-        
-        try:
-            result = await query_engine.process_query(request.documents, request.questions)
-            if 'error' in result:
-                raise HTTPException(status_code=500, detail=result['error'])
-            return result
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-# ========================
-# 💻 STREAMLIT FRONTEND (Only when in Streamlit)
-# ========================
-
-if IS_STREAMLIT:
-    
-    # Page config
-    st.set_page_config(
-        page_title="🧠 AI Document Query System",
-        page_icon="🔥",
-        layout="wide"
-    )
-    
-    # Custom CSS
+# Custom CSS for professional styling
+def load_css():
     st.markdown("""
     <style>
+    /* Main app styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    
+    /* Custom headers */
     .main-header {
         font-size: 3rem;
         font-weight: 700;
@@ -588,6 +174,84 @@ if IS_STREAMLIT:
         text-align: center;
         margin-bottom: 1rem;
     }
+    
+    .sub-header {
+        font-size: 1.2rem;
+        color: #666;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    
+    /* Metric cards */
+    .metric-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        border-left: 4px solid #667eea;
+        margin: 1rem 0;
+    }
+    
+    /* Status indicators */
+    .status-connected {
+        color: #28a745;
+        font-weight: bold;
+    }
+    
+    .status-error {
+        color: #dc3545;
+        font-weight: bold;
+    }
+    
+    .status-warning {
+        color: #ffc107;
+        font-weight: bold;
+    }
+    
+    /* Answer cards - adaptive for dark and light themes */
+    .answer-card {
+        background: var(--background-color, #1e1e1e);
+        color: var(--text-color, #ffffff) !important;
+        border: 1px solid #444;
+        border-radius: 8px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        position: relative;
+    }
+
+    
+    .confidence-high {
+        border-left: 4px solid #28a745;
+    }
+    
+    .confidence-medium {
+        border-left: 4px solid #ffc107;
+    }
+    
+    .confidence-low {
+        border-left: 4px solid #dc3545;
+    }
+    
+    .confidence-score {
+        position: absolute;
+        top: 10px;
+        right: 15px;
+        font-weight: bold;
+        font-size: 0.9rem;
+    }
+    
+    /* Progress styling */
+    .stProgress > div > div > div > div {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        background: linear-gradient(180deg,
+#ffffff 100%);
+    }
+    
+    /* Feature boxes */
     .feature-box {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white;
@@ -596,384 +260,537 @@ if IS_STREAMLIT:
         margin: 0.5rem 0;
         text-align: center;
     }
-    .answer-card {
-        background: #f8f9fa;
-        border-radius: 8px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        border-left: 4px solid #667eea;
+    
+    /* Audit trail */
+    .audit-step {
+        background: #f1f3f4;
+        padding: 0.5rem 1rem;
+        margin: 0.25rem 0;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.85rem;
+        border-left: 3px solid #667eea;
     }
-    .confidence-high { border-left-color: #28a745; }
-    .confidence-medium { border-left-color: #ffc107; }
-    .confidence-low { border-left-color: #dc3545; }
     </style>
     """, unsafe_allow_html=True)
+
+class DocumentQueryUI:
+    def __init__(self):
+        # default base url - kept as original
+        self.api_base_url = "http://localhost:8000"  # Change to your deployed URL if desired
+        self.hackrx_token = "90bf5fcfc3d0de340e50ac29a5cf53eb6da42e7a24af15f2111186878d510d6c"
+        
+    def check_system_health(self):
+        """Check if the backend system is healthy"""
+        try:
+            response = requests.get(f"{self.api_base_url}/health", timeout=5)
+            return response.status_code == 200, response.json() if response.status_code == 200 else None
+        except requests.exceptions.RequestException:
+            return False, None
     
-    # Initialize session state
-    if 'query_engine' not in st.session_state:
-        with st.spinner("🚀 Initializing AI system..."):
-            st.session_state.query_engine = UnifiedQueryEngine()
+    def get_system_info(self):
+        """Get system configuration information"""
+        try:
+            response = requests.get(f"{self.api_base_url}/system-info", timeout=5)
+            return response.json() if response.status_code == 200 else None
+        except requests.exceptions.RequestException:
+            return None
     
-    if 'questions' not in st.session_state:
-        st.session_state.questions = [""]
-    
-    # Header
+    def query_documents(self, document_url: str, questions: List[str]):
+        """Send query to the backend system"""
+        headers = {
+            "Authorization": f"Bearer {self.hackrx_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "documents": document_url,
+            "questions": questions
+        }
+        
+        try:
+            response = requests.post(
+                f"{self.api_base_url}/hackrx/run",
+                headers=headers,
+                json=payload,
+                timeout=120  # 2 minutes timeout for processing
+            )
+            
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"HTTP {response.status_code}: {response.text}"}
+                
+        except requests.exceptions.RequestException as e:
+            return False, {"error": f"Request failed: {str(e)}"}
+
+def render_header():
+    """Render the main header section"""
     st.markdown('<div class="main-header">🧠🔥 AI Document Query System</div>', unsafe_allow_html=True)
-    st.markdown('<div style="text-align: center; color: #666; margin-bottom: 2rem;">Enhanced hybrid retrieval with knowledge graphs • Powered by Groq API</div>', unsafe_allow_html=True)
-    
-    # Features showcase
+    st.markdown('<div class="sub-header">Enhanced hybrid retrieval with knowledge graphs • Powered by Groq API</div>', unsafe_allow_html=True)
+
+def render_sidebar_status(ui_handler):
+    """Render system status in sidebar"""
+    with st.sidebar:
+        st.header("🔧 System Status")
+        
+        # Check system health
+        is_healthy, health_data = ui_handler.check_system_health()
+        
+        if is_healthy:
+            st.success("✅ System Online")
+            
+            if health_data:
+                groq_status = health_data.get('groq_api_status', 'unknown')
+                if groq_status == 'connected':
+                    st.markdown('<div class="status-connected">🤖 Groq API: Connected</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="status-error">🤖 Groq API: Disconnected</div>', unsafe_allow_html=True)
+                
+                st.info(f"🧠 Model: {health_data.get('model', 'Unknown')}")
+                
+                # Component status
+                components = health_data.get('components', {})
+                st.subheader("📊 Components")
+                for component, status in components.items():
+                    if status in ['ready', 'connected']:
+                        st.success(f"✅ {component.replace('_', ' ').title()}")
+                    else:
+                        st.error(f"❌ {component.replace('_', ' ').title()}")
+        else:
+            st.error("❌ System Offline")
+            st.warning("Please check if the backend server is running")
+        
+        # System info
+        system_info = ui_handler.get_system_info()
+        if system_info:
+            st.subheader("⚙️ Configuration")
+            st.json({
+                "Model": system_info.get('current_model', 'Unknown'),
+                "Max Tokens": system_info.get('configuration', {}).get('max_tokens', 'Unknown'),
+                "Retrieval K": system_info.get('configuration', {}).get('top_k_retrieval', 'Unknown')
+            })
+
+def render_features_showcase():
+    """Render system features showcase"""
     st.subheader("🚀 System Features")
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.markdown('<div class="feature-box"><h4>🧠 Groq API</h4><p>Best open-source LLMs</p></div>', unsafe_allow_html=True)
+        st.markdown("<div class='feature-box'>🔍 Hybrid Retrieval</div>", unsafe_allow_html=True)
+        st.write("Combines semantic search and keyword matching for precision.")
     with col2:
-        st.markdown('<div class="feature-box"><h4>🔍 Hybrid Search</h4><p>Semantic + Keyword</p></div>', unsafe_allow_html=True)
+        st.markdown("<div class='feature-box'>🕸️ Knowledge Graph</div>", unsafe_allow_html=True)
+        st.write("Relates clauses and detects conflicts/dependencies.")
     with col3:
-        st.markdown('<div class="feature-box"><h4>🕸️ Knowledge Graph</h4><p>Conflict Detection</p></div>', unsafe_allow_html=True)
+        st.markdown("<div class='feature-box'>🤖 Groq LLM</div>", unsafe_allow_html=True)
+        st.write("High-quality reasoning and structured outputs.")
+
+def render_help_section():
+    """Render help and documentation section"""
+    st.header("📚 Help & Documentation")
     
+    tab1, tab2, tab3, tab4 = st.tabs(["🚀 Quick Start", "📋 API Guide", "🔧 Troubleshooting", "💡 Tips"])
+    
+    with tab1:
+        st.markdown("""
+        ## 🚀 Quick Start Guide
+        
+        ### 1. Prepare Your Document
+        - Ensure your document is accessible via a public URL
+        - Supported formats: PDF, DOCX, EML
+        - Document should contain structured text (insurance policies, contracts, etc.)
+        
+        ### 2. Ask Your Questions
+        - Be specific and clear in your questions
+        - Use question templates for common scenarios
+        - You can ask up to 10 questions per document
+        
+        ### 3. Review Results
+        - Check confidence scores for answer reliability
+        - Review source clauses for verification
+        - Look for conflicts between different clauses
+        
+        ### 4. Export & Share
+        - Download results in JSON or CSV format
+        - Share specific answers using the copy feature
+        """)
+    
+    with tab2:
+        st.markdown("""
+        ## 📋 API Integration Guide
+        
+        ### Backend Endpoints
+        ```
+        GET  /                 - System information
+        GET  /health          - Health check
+        GET  /system-info     - Configuration details
+        POST /hackrx/run      - Main query endpoint
+        ```
+        
+        ### Request Format
+        ```json
+        {
+          "documents": "https://example.com/document.pdf",
+          "questions": [
+            "What is covered under this policy?",
+            "What are the exclusions?"
+          ]
+        }
+        ```
+        
+        ### Response Format
+        ```json
+        {
+          "answers": [
+            {
+              "question": "What is covered?",
+              "answer": "The policy covers.",
+              "confidence": 0.85,
+              "source_clauses": ["Clause 1", "Clause 2"],
+              "justification": "Analysis based on.",
+              "conflicts_detected": []
+            }
+          ],
+          "processing_time": 12.34,
+          "audit_trail": ["Step 1", "Step 2"]
+        }
+        ```
+        """)
+    
+    with tab3:
+        st.markdown("""
+        **Common issues & fixes**
+        - Backend not running: start your server or use the local-start controls in the sidebar
+        - Document URL unreachable: ensure file is public
+        - Groq issues: verify GROQ_API_KEY environment variable
+        """)
+    with tab4:
+        st.markdown("Tip: Break large documents into smaller ones for faster processing.")
+
+def render_answer_card(answer_item: Dict, index: int):
+    """Render a single answer card"""
+    confidence = answer_item.get('confidence', 0.0)
+    classes = "answer-card "
+    if confidence >= 0.8:
+        classes += "confidence-high"
+    elif confidence >= 0.5:
+        classes += "confidence-medium"
+    else:
+        classes += "confidence-low"
+    
+    st.markdown(f"<div class='{classes}'>", unsafe_allow_html=True)
+    st.markdown(f"**Q{index+1}:** {answer_item.get('question','')}")
+    st.markdown(f"**Answer:** {answer_item.get('answer','')}")
+    st.markdown(f"<div class='confidence-score'>{confidence:.0%}</div>", unsafe_allow_html=True)
+    if answer_item.get('source_clauses'):
+        st.markdown("**Sources:**")
+        for src in answer_item.get('source_clauses', []):
+            st.markdown(f"- {src}")
+    if answer_item.get('justification'):
+        st.markdown("**Justification:**")
+        st.code(answer_item.get('justification', ''), language="text")
+    if answer_item.get('conflicts_detected'):
+        st.warning(f"Conflicts detected: {', '.join(answer_item.get('conflicts_detected', []))}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def render_processing_metrics(response_data: Dict):
+    """Render processing performance metrics"""
+    processing_time = response_data.get('processing_time', 0)
+    answers = response_data.get('answers', [])
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("⏱️ Processing Time", f"{processing_time:.2f}s")
+    
+    with col2:
+        st.metric("❓ Questions Processed", len(answers))
+    
+    with col3:
+        avg_confidence = sum(ans.get('confidence', 0) for ans in answers) / len(answers) if answers else 0
+        st.metric("📊 Avg Confidence", f"{avg_confidence:.0%}")
+    
+    with col4:
+        total_conflicts = sum(len(ans.get('conflicts_detected', [])) for ans in answers)
+        st.metric("⚠️ Total Conflicts", total_conflicts)
+
+def render_audit_trail(audit_trail: List[str]):
+    """Render the processing audit trail"""
+    st.subheader("🔍 Processing Audit Trail")
+    
+    with st.expander("View detailed processing steps", expanded=False):
+        for step in audit_trail:
+            st.markdown(f'<div class="audit-step">{step}</div>', unsafe_allow_html=True)
+
+# ---------------------------
+# Main application function — with added local-backend sidebar controls
+# ---------------------------
+
+def main():
+    """Main application function"""
+    load_css()
+    st.title("📄 Document Analysis — Frontend (with optional local-backend)")
+
+    # Sidebar: backend controls (ADDED)
+    st.sidebar.header("Backend Options")
+    api_url_input = st.sidebar.text_input("Backend base URL", value="http://localhost:8000")
+    prefer_local = st.sidebar.checkbox("Prefer local backend if available", value=True)
+    st.sidebar.markdown("**Local backend (optional)** — spawns your unmodified main.py")
+    col_a, col_b = st.sidebar.columns([2,1])
+    python_exec = col_a.text_input("Python executable for local backend", value=sys.executable)
+    local_port = col_b.number_input("Local backend port", value=8000, min_value=1024, max_value=65535, step=1)
+    main_py_path = st.sidebar.text_input("Path to main.py", value="main.py")
+    auto_start_local = st.sidebar.checkbox("Auto-start local backend if not running", value=False)
+    start_local_btn = st.sidebar.button("Start local backend")
+    stop_local_btn = st.sidebar.button("Stop local backend")
+    health_check_btn = st.sidebar.button("Check local backend health")
+
+    # Create or update controller in session state
+    if "local_backend_controller" not in st.session_state:
+        st.session_state["local_backend_controller"] = LocalBackendController(
+            python_executable=python_exec,
+            main_path=main_py_path,
+            host="127.0.0.1",
+            port=int(local_port),
+            env=os.environ.copy()
+        )
+    else:
+        # update controller params in case user changed them
+        controller: LocalBackendController = st.session_state["local_backend_controller"]
+        controller.python_executable = python_exec
+        controller.main_path = main_py_path
+        controller.port = int(local_port)
+
+    controller: LocalBackendController = st.session_state["local_backend_controller"]
+
+    # Button actions
+    if start_local_btn:
+        st.sidebar.info("Starting local backend (this runs your unmodified main.py)...")
+        ok, msg = controller.start(timeout=30.0)
+        if ok:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.error(msg)
+
+    if stop_local_btn:
+        ok, msg = controller.stop()
+        if ok:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.warning(msg)
+
+    if health_check_btn:
+        if controller.is_running():
+            st.sidebar.success(f"Backend reachable at {controller.base_url}")
+        else:
+            st.sidebar.error(f"Backend not reachable at {controller.base_url}")
+
+    # Auto-start behavior
+    if auto_start_local and prefer_local and not controller.is_running():
+        st.sidebar.info("Auto-starting local backend...")
+        ok, msg = controller.start(timeout=20.0)
+        if ok:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.warning(msg)
+
+    # Decide final backend URL to use
+    def choose_backend_url() -> str:
+        if prefer_local and controller.is_running():
+            return controller.base_url
+        return api_url_input.rstrip("/")
+
+    # Initialize UI handler (keeps original behavior)
+    ui_handler = DocumentQueryUI()
+    # Update UI handler's api_base_url to chosen backend
+    ui_handler.api_base_url = choose_backend_url()
+
+    # Header + status
+    render_header()
+    render_sidebar_status(ui_handler)
+    render_features_showcase()
+
     st.markdown("---")
-    
-    # Main interface
+
+    # Main query interface
     st.header("📄 Document Analysis")
-    
-    # Document input
-    col1, col2 = st.columns([3, 1])
+    col1, col2 = st.columns([2, 1])
     with col1:
         document_url = st.text_input(
             "📎 Document URL",
             placeholder="https://example.com/document.pdf",
-            help="PDF, DOCX, or EML document URL"
+            help="Enter the URL of the PDF, DOCX, or EML document to analyze"
         )
-    
     with col2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("📋 Use Sample", type="secondary"):
-            document_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
-            st.rerun()
-    
-    # Questions section
-    st.subheader("❓ Your Questions")
-    
-    # Quick templates
-    with st.expander("🎯 Quick Templates"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("💰 Coverage"):
+        st.markdown("<br>", unsafe_allow_html=True)  # Spacing
+        use_sample = st.button("📋 Use Sample Document", type="secondary")
+        if use_sample:
+            document_url = "https://example.com/sample-insurance-policy.pdf"
+            st.experimental_rerun()
+
+    # Questions input
+    st.subheader("❓ Questions to Ask")
+    with st.expander("🎯 Quick Question Templates"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("💰 Coverage Questions"):
                 st.session_state.questions = [
-                    "What is covered under this policy?",
+                    "What medical conditions are covered under this policy?",
                     "What is the maximum coverage amount?",
                     "Are pre-existing conditions covered?"
                 ]
-                st.rerun()
-        with col2:
-            if st.button("❌ Exclusions"):
+        with c2:
+            if st.button("❌ Exclusion Questions"):
                 st.session_state.questions = [
-                    "What is excluded from coverage?",
-                    "Are there age restrictions?",
-                    "What activities void coverage?"
+                    "What treatments or conditions are excluded?",
+                    "Are there any age-related exclusions?",
+                    "What activities void the coverage?"
                 ]
-                st.rerun()
-        with col3:
-            if st.button("⏰ Timing"):
+        with c3:
+            if st.button("⏰ Timing Questions"):
                 st.session_state.questions = [
-                    "What is the waiting period?",
-                    "When does coverage start?",
-                    "What are the claim time limits?"
+                    "What is the waiting period for coverage?",
+                    "When does the policy become effective?",
+                    "Are there any time limits for claims?"
                 ]
-                st.rerun()
-    
-    # Dynamic question input
+
+    # Dynamic question inputs
+    if 'questions' not in st.session_state:
+        st.session_state.questions = [""]
+
     questions = []
     for i in range(len(st.session_state.questions)):
         question = st.text_input(
             f"Question {i+1}",
             value=st.session_state.questions[i],
-            key=f"q_{i}"
+            key=f"question_{i}"
         )
         if question.strip():
             questions.append(question.strip())
-    
-    # Add/Remove buttons
-    col1, col2 = st.columns(2)
-    with col1:
+
+    col_a, col_b = st.columns([1,1])
+    with col_a:
         if st.button("➕ Add Question"):
             st.session_state.questions.append("")
-            st.rerun()
-    with col2:
-        if len(st.session_state.questions) > 1 and st.button("➖ Remove Last"):
+            st.experimental_rerun()
+    with col_b:
+        if len(st.session_state.questions) > 1 and st.button("➖ Remove Last Question"):
             st.session_state.questions.pop()
-            st.rerun()
-    
+            st.experimental_rerun()
+
     # Process button
     st.markdown("---")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        if st.button("🚀 Analyze Document", type="primary", use_container_width=True):
-            
-            if not document_url or not questions:
-                st.error("❌ Please provide document URL and at least one question")
-            
-            elif not st.session_state.query_engine.llm:
-                st.error("❌ LLM not initialized. Please check your Groq API key.")
-            
-            else:
-                # Processing with progress
-                progress_container = st.container()
-                
-                with progress_container:
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    steps = [
-                        "📥 Downloading document...",
-                        "📄 Parsing content...",
-                        "🔍 Setting up retrieval...",
-                        "🧠 Processing questions...",
-                        "✅ Finalizing results..."
-                    ]
-                    
-                    async def run_analysis():
-                        for i, step in enumerate(steps[:-1]):
-                            status_text.text(step)
-                            progress_bar.progress((i + 1) / len(steps))
-                            await asyncio.sleep(0.1)
-                        
-                        # Actual processing
-                        status_text.text("🤖 Running AI analysis...")
-                        result = await st.session_state.query_engine.process_query(document_url, questions)
-                        
-                        progress_bar.progress(1.0)
-                        status_text.text("✅ Analysis complete!")
-                        return result
-                    
-                    # Run async processing
-                    try:
-                        result = asyncio.run(run_analysis())
-                        
-                        # Clear progress indicators
-                        time.sleep(1)
-                        progress_bar.empty()
-                        status_text.empty()
-                        
-                        # Display results
-                        if 'error' in result:
-                            st.error(f"❌ {result['error']}")
-                        else:
-                            st.success("🎉 Analysis completed!")
-                            
-                            # Metrics
-                            answers = result.get('answers', [])
-                            processing_time = result.get('processing_time', 0)
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("⏱️ Time", f"{processing_time:.1f}s")
-                            with col2:
-                                st.metric("❓ Questions", len(answers))
-                            with col3:
-                                avg_conf = sum(a['confidence'] for a in answers) / len(answers) if answers else 0
-                                st.metric("📊 Avg Confidence", f"{avg_conf:.0%}")
-                            
-                            st.markdown("---")
-                            
-                            # Display answers
-                            st.header("📋 Results")
-                            
-                            for i, answer in enumerate(answers):
-                                confidence = answer['confidence']
-                                conf_class = "high" if confidence >= 0.8 else "medium" if confidence >= 0.5 else "low"
-                                
-                                with st.expander(f"❓ Question {i+1}: {answer['question'][:80]}...", expanded=True):
-                                    
-                                    # Confidence gauge
-                                    col1, col2 = st.columns([3, 1])
-                                    
-                                    with col1:
-                                        st.markdown(f"**Q:** {answer['question']}")
-                                    
-                                    with col2:
-                                        # Simple confidence indicator
-                                        conf_color = "#28a745" if confidence >= 0.8 else "#ffc107" if confidence >= 0.5 else "#dc3545"
-                                        st.markdown(f"<div style='text-align: right; color: {conf_color}; font-weight: bold; font-size: 1.2rem'>{confidence:.0%} Confidence</div>", unsafe_allow_html=True)
-                                    
-                                    # Answer
-                                    st.markdown("### 📝 Answer")
-                                    st.markdown(f'<div class="answer-card confidence-{conf_class}">{answer["answer"]}</div>', unsafe_allow_html=True)
-                                    
-                                    # Details tabs
-                                    tab1, tab2, tab3 = st.tabs(["📊 Sources", "🔍 Analysis", "⚠️ Conflicts"])
-                                    
-                                    with tab1:
-                                        if answer['source_clauses']:
-                                            for j, clause in enumerate(answer['source_clauses'], 1):
-                                                st.markdown(f"{j}. {clause}")
-                                        else:
-                                            st.info("No sources identified")
-                                    
-                                    with tab2:
-                                        st.code(answer['justification'])
-                                    
-                                    with tab3:
-                                        conflicts = answer['conflicts_detected']
-                                        if conflicts:
-                                            st.warning(f"⚠️ {len(conflicts)} conflicts detected:")
-                                            for conflict in conflicts:
-                                                st.markdown(f"• {conflict}")
-                                        else:
-                                            st.success("✅ No conflicts detected")
-                            
-                            # Audit trail
-                            with st.expander("🔍 Processing Steps"):
-                                for step in result.get('audit_trail', []):
-                                    st.text(step)
-                            
-                            # Export results
-                            st.markdown("---")
-                            st.subheader("💾 Export Results")
-                            
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                json_data = json.dumps(result, indent=2, default=str)
-                                st.download_button(
-                                    "📄 Download JSON",
-                                    json_data,
-                                    f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                                    "application/json"
-                                )
-                            
-                            with col2:
-                                if answers:
-                                    df_data = [{
-                                        'Question': ans['question'],
-                                        'Answer': ans['answer'],
-                                        'Confidence': ans['confidence'],
-                                        'Sources': '; '.join(ans['source_clauses'])
-                                    } for ans in answers]
-                                    
-                                    df = pd.DataFrame(df_data)
-                                    csv_data = df.to_csv(index=False)
-                                    
-                                    st.download_button(
-                                        "📊 Download CSV",
-                                        csv_data,
-                                        f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                        "text/csv"
-                                    )
-                    
-                    except Exception as e:
-                        st.error(f"❌ Processing failed: {str(e)}")
-                        
-                        # Troubleshooting
-                        with st.expander("🔧 Troubleshooting"):
-                            st.markdown("""
-                            **Common fixes:**
-                            1. Check your Groq API key in Streamlit secrets
-                            2. Ensure document URL is publicly accessible
-                            3. Try with fewer questions
-                            4. Check document format (PDF/DOCX/EML only)
-                            5. Verify internet connection
-                            """)
-    
-    # Sidebar with system info
-    with st.sidebar:
-        st.header("🔧 System Status")
-        
-        # Check if LLM is ready
-        if st.session_state.query_engine.llm:
-            st.success("✅ Groq LLM Ready")
-            st.info(f"🤖 Model: {Config.LLM_MODEL_NAME}")
+    colx, coly, colz = st.columns([1, 2, 1])
+    with coly:
+        process_button = st.button(
+            "🚀 Analyze Document",
+            type="primary",
+            use_container_width=True,
+            disabled=not document_url or not questions
+        )
+
+    # Execution: call backend using ui_handler.query_documents (unchanged)
+    if process_button:
+        if not document_url:
+            st.error("❌ Please provide a document URL")
+        elif not questions:
+            st.error("❌ Please provide at least one question")
         else:
-            st.error("❌ LLM Not Ready")
-            st.warning("Check Groq API key")
-        
-        st.markdown("---")
-        
-        # Configuration
-        st.header("⚙️ Configuration")
-        
-        # Model selection
-        selected_model = st.selectbox(
-            "🧠 LLM Model",
-            Config.LLM_MODEL_OPTIONS,
-            index=0,
-            help="Choose the Groq model to use"
-        )
-        
-        if selected_model != Config.LLM_MODEL_NAME:
-            Config.LLM_MODEL_NAME = selected_model
-            if st.session_state.query_engine.llm:
-                st.session_state.query_engine.llm.model_name = selected_model
-            st.success(f"✅ Switched to {selected_model}")
-        
-        # Processing settings
-        st.markdown("**Processing Settings:**")
-        chunk_size = st.slider("Chunk Size", 256, 1024, Config.CHUNK_SIZE)
-        top_k = st.slider("Retrieval K", 3, 10, Config.TOP_K_RETRIEVAL)
-        temperature = st.slider("Temperature", 0.0, 1.0, Config.TEMPERATURE, 0.1)
-        
-        # Update config
-        Config.CHUNK_SIZE = chunk_size
-        Config.TOP_K_RETRIEVAL = top_k
-        Config.TEMPERATURE = temperature
-        
-        st.markdown("---")
-        
-        # API Info
-        st.header("📊 Model Info")
-        st.json({
-            "provider": "Groq API",
-            "current_model": Config.LLM_MODEL_NAME,
-            "embedding_model": Config.EMBEDDING_MODEL,
-            "features": ["Hybrid Retrieval", "Knowledge Graph", "Conflict Detection"]
-        })
-        
-        st.markdown("---")
-        
-        # Help section
-        with st.expander("📚 Quick Help"):
-            st.markdown("""
-            **Setup:**
-            1. Set GROQ_API_KEY in Streamlit secrets
-            2. Provide publicly accessible document URL
-            3. Ask specific questions
-            4. Review results with confidence scores
-            
-            **Tips:**
-            - Be specific in questions
-            - Check confidence scores
-            - Review source clauses
-            - Look for conflicts
-            """)
+            # Update ui_handler.api_base_url before calling
+            ui_handler.api_base_url = choose_backend_url()
+            st.info(f"🔗 Using backend: {ui_handler.api_base_url}")
+            with st.spinner("🔄 Processing document and questions. This may take some time..."):
+                progress_bar = st.progress(0)
+                try:
+                    ok, response_data = ui_handler.query_documents(document_url, questions)
+                    progress_bar.progress(100)
+                except Exception as e:
+                    ok = False
+                    response_data = {"error": str(e)}
 
-# ========================
-# 🏃‍♂️ UNIFIED ENTRY POINT
-# ========================
-
-def main():
-    """Unified entry point - detects mode and runs appropriate service"""
+                if ok:
+                    st.success("✅ Analysis completed")
+                    render_processing_metrics(response_data)
+                    st.markdown("---")
+                    st.header("Results")
+                    answers = response_data.get('answers', [])
+                    if answers:
+                        for i, answer_item in enumerate(answers):
+                            render_answer_card(answer_item, i)
+                    else:
+                        st.warning("No answers were generated")
+                    
+                    # Audit trail
+                    audit_trail = response_data.get('audit_trail', [])
+                    if audit_trail:
+                        render_audit_trail(audit_trail)
+                    
+                    # Download results
+                    st.markdown("---")
+                    st.subheader("💾 Export Results")
+                    
+                    col1d, col2d = st.columns(2)
+                    
+                    with col1d:
+                        # JSON export
+                        json_data = json.dumps(response_data, indent=2)
+                        st.download_button(
+                            label="📄 Download JSON",
+                            data=json_data,
+                            file_name=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json"
+                        )
+                    
+                    with col2d:
+                        # CSV export for answers
+                        if answers:
+                            df_data = []
+                            for i, ans in enumerate(answers, 1):
+                                df_data.append({
+                                    'Question_ID': i,
+                                    'Question': ans.get('question', ''),
+                                    'Answer': ans.get('answer', ''),
+                                    'Confidence': ans.get('confidence', 0),
+                                    'Source_Clauses': '; '.join(ans.get('source_clauses', [])),
+                                    'Conflicts': '; '.join(ans.get('conflicts_detected', [])),
+                                    'Justification': ans.get('justification', '')
+                                })
+                            
+                            df = pd.DataFrame(df_data)
+                            csv_data = df.to_csv(index=False)
+                            
+                            st.download_button(
+                                label="📊 Download CSV",
+                                data=csv_data,
+                                file_name=f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                mime="text/csv"
+                            )
+                else:
+                    st.error("❌ Analysis failed")
+                    error_msg = response_data.get('error', 'Unknown error occurred')
+                    st.error(f"Error details: {error_msg}")
+                    
+                    # Troubleshooting tips
+                    with st.expander("🔧 Troubleshooting Tips"):
+                        st.markdown("""
+                        **Common issues:**
+                        1. **Document URL not accessible**: Ensure the URL is publicly accessible
+                        2. **Server not running**: Check if the backend service is running on the correct port
+                        3. **Groq API key**: Verify that GROQ_API_KEY environment variable is set
+                        4. **Network issues**: Check your internet connection
+                        5. **Document format**: Ensure document is PDF, DOCX, or EML format
+                        
+                        **Quick fixes:**
+                        - Try a different document URL
+                        - Restart the backend server (use the sidebar controls if you want the UI to start it)
+                        - Check system status in the sidebar
+                        - Reduce the number of questions
+                        """)
     
-    if IS_STREAMLIT:
-        # Streamlit mode - UI is already rendered above
-        pass
-    else:
-        # FastAPI mode - start the server
-        port = int(os.environ.get("PORT", 8000))
-        
-        logger.info("🧠🔥 AI DOCUMENT QUERY SYSTEM")
-        logger.info("=" * 50)
-        logger.info(f"🚀 Starting FastAPI server on port {port}")
-        logger.info(f"🤖 Using Groq API with: {Config.LLM_MODEL_NAME}")
-        logger.info(f"🔍 Hybrid retrieval enabled")
-        logger.info(f"🕸️ Knowledge graph enabled")
-        logger.info("=" * 50)
-        
-        uvicorn.run(
-            "unified_app:app",  # This file
-            host="0.0.0.0",
-            port=port,
-            log_level="info"
-        )
+    st.markdown("---")
+    st.markdown("📌 Tip: If you want this UI to spawn your backend automatically, enable the local backend controls in the sidebar and press **Start local backend**. The UI will then prefer the local backend when available.")
 
 if __name__ == "__main__":
     main()
